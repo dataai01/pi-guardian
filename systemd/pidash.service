@@ -1,0 +1,20 @@
+[Unit]
+Description=Pi Guardian dashboard (Flask)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=pi-guardian
+Group=pi-guardian
+EnvironmentFile=-/etc/pi-guardian/pi-guardian.env
+WorkingDirectory=/opt/pi-guardian
+ExecStart=/opt/pi-guardian/.venv/bin/python /opt/pi-guardian/src/pi_guardian/dash.py
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/var/lib/pi-guardian
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local runtime/config files
+*.log
+*.pid
+.env
+pi-guardian.env
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

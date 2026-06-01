@@ -1,0 +1,10 @@
+[Unit]
+Description=Pi Guardian nightly backup
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/pi-guardian/pi-guardian.env
+ExecStart=/bin/bash /opt/pi-guardian/scripts/backup.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

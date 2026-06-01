@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pi Guardian: A One-Script Safety Layer for Headless Raspberry Pis</title>
+  <style>
+    body {
+      color: #242424;
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.65;
+      margin: 0;
+      padding: 48px 20px;
+      background: #ffffff;
+    }
+
+    article {
+      max-width: 740px;
+      margin: 0 auto;
+    }
+
+    h1, h2 {
+      color: #111111;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      line-height: 1.2;
+    }
+
+    h1 {
+      font-size: 42px;
+      margin: 0 0 28px;
+    }
+
+    h2 {
+      font-size: 28px;
+      margin: 44px 0 16px;
+    }
+
+    p {
+      font-size: 20px;
+      margin: 0 0 22px;
+    }
+
+    ul {
+      font-size: 20px;
+      margin: 0 0 24px 28px;
+      padding: 0;
+    }
+
+    li {
+      margin: 7px 0;
+    }
+
+    code {
+      background: #f2f2f2;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 0.88em;
+      padding: 2px 5px;
+    }
+
+    pre {
+      background: #f6f8fa;
+      border: 1px solid #d8dee4;
+      border-radius: 8px;
+      color: #24292f;
+      font-size: 15px;
+      line-height: 1.45;
+      margin: 0 0 26px;
+      overflow-x: auto;
+      padding: 16px;
+      white-space: pre;
+    }
+
+    pre code {
+      background: transparent;
+      border-radius: 0;
+      font-size: inherit;
+      padding: 0;
+    }
+  </style>
+</head>
+<body>
+<article>
+  <h1>Pi Guardian: A One-Script Safety Layer for Headless Raspberry Pis</h1>
+
+  <p>Running a Raspberry Pi as a small server is easy until it is not. The hard part usually starts after the Pi is deployed somewhere without a monitor, keyboard, or easy physical access. Remote access needs to be secure. SSH needs to be reliable. Backups need to happen without manual effort. Health problems should be visible before the device silently disappears.</p>
+
+  <p>Pi Guardian was built for that exact problem.</p>
+
+  <p>It is a small Raspberry Pi hardening and monitoring toolkit designed around one goal: make a headless Pi safer and easier to operate with a single installer script.</p>
+
+  <p>The source and future updates are available on GitHub: <a href="https://github.com/dataai01/pi-guardian">github.com/dataai01/pi-guardian</a>.</p>
+
+  <p>The application combines four practical pieces:</p>
+
+  <ul>
+    <li>Secure remote access through Tailscale</li>
+    <li>SSH hardening and firewall rules</li>
+    <li>Health monitoring with optional alerts</li>
+    <li>A lightweight dashboard and nightly backups</li>
+  </ul>
+
+  <p>The newest version is self-contained. You can copy only <code>install.sh</code> to a Pi and run it. The installer writes the Python application, configuration, backup script, and systemd units into place automatically.</p>
+
+  <pre><code>sudo bash ./install.sh</code></pre>
+
+  <p>For a headless setup, the recommended path is to use a Tailscale auth key:</p>
+
+  <pre><code>export TS_AUTHKEY=&lt;your-tailscale-auth-key&gt;
+sudo -E bash ./install.sh --ts-hostname my-pi</code></pre>
+
+  <p>That avoids needing to open a browser on the Pi itself.</p>
+
+  <h2>Why Tailscale?</h2>
+
+  <p>A lot of Raspberry Pi guides still rely on port forwarding, dynamic DNS, or exposing SSH to the public internet. Pi Guardian intentionally avoids that.</p>
+
+  <p>Instead, it uses an overlay network. By default, the installer sets up Tailscale and allows SSH and dashboard access only through the <code>tailscale0</code> interface.</p>
+
+  <p>That means the Pi can be reached from your private tailnet without opening inbound ports on your router.</p>
+
+  <p>The installer also avoids a common failure mode: locking yourself out. If Tailscale is not authenticated yet, Pi Guardian skips UFW firewall changes rather than blindly enabling restrictive rules.</p>
+
+  <p>That behavior is intentional. A secure installer should not make the machine unreachable during setup.</p>
+
+  <h2>What the Installer Does</h2>
+
+  <p>The heart of the project is <code>install.sh</code>.</p>
+
+  <p>The script is now self-installing. It does not depend on the rest of the repository being present on the Pi. Internally, it writes the application files using embedded heredocs, creates directories under <code>/opt/pi-guardian</code>, installs systemd units, and prepares configuration under <code>/etc/pi-guardian</code>.</p>
+
+  <p>The major steps are:</p>
+
+  <pre><code>install_dependencies
+ensure_app_user
+write_application_files
+write_config
+install_python_env
+configure_ssh
+install_tailscale
+write_systemd_units
+enable_services
+configure_firewall</code></pre>
+
+  <p>This keeps the install process readable while still allowing the script to be distributed as a single file.</p>
+
+  <p>The installer creates an unprivileged service user:</p>
+
+  <pre><code>APP_USER="pi-guardian"
+APP_GROUP="pi-guardian"</code></pre>
+
+  <p>The dashboard and health agent run as that user, not as root. Backup still runs as root because it needs to read <code>/etc</code> and <code>/home</code>.</p>
+
+  <h2>Tailscale Setup</h2>
+
+  <p>Tailscale configuration is one of the most important parts of the script because it is also where headless installs often fail.</p>
+
+  <p>Pi Guardian supports several flows:</p>
+
+  <pre><code>--ts-authkey KEY
+--ts-authkey-file PATH
+--ts-hostname NAME
+--tailscale-tags tag:server
+--no-tailscale-ssh
+--skip-tailscale-up</code></pre>
+
+  <p>If an auth key is provided, the installer runs <code>tailscale up</code> non-interactively. If no key is provided and a terminal is available, it starts the interactive login flow. If neither is possible, it installs Tailscale and prints the command to run later.</p>
+
+  <pre><code>sudo tailscale up --ssh</code></pre>
+
+  <p>The intention is simple: the installer should support both automated provisioning and manual setup without hiding what is happening.</p>
+
+  <h2>Health Monitoring</h2>
+
+  <p>The health agent lives in <code>health.py</code>.</p>
+
+  <p>It checks:</p>
+
+  <ul>
+    <li>CPU temperature</li>
+    <li>Disk usage</li>
+    <li>Raspberry Pi undervoltage state</li>
+    <li>Configured systemd services</li>
+  </ul>
+
+  <p>Service names come from the environment file:</p>
+
+  <pre><code>SERVICES=ssh tailscaled
+TEMP_MAX=80
+DISK_PCT_MAX=90</code></pre>
+
+  <p>The agent reads Raspberry Pi temperature from sysfs when available, with a fallback to <code>vcgencmd</code>. It also checks undervoltage bits, which is useful because power problems are one of the most common Raspberry Pi reliability issues.</p>
+
+  <p>When something is wrong, Pi Guardian can send alerts through Slack, Telegram, or SMTP email.</p>
+
+  <p>The script is deliberately conservative. It avoids shell interpolation for service checks and validates service names before calling systemd. That matters because service names are configuration input, and configuration input should not become shell code.</p>
+
+  <h2>The Dashboard</h2>
+
+  <p>The dashboard is intentionally small. It is a Flask application served on port <code>8080</code>.</p>
+
+  <p>It shows:</p>
+
+  <ul>
+    <li>Hostname and uptime</li>
+    <li>Tailscale IP</li>
+    <li>LAN IP</li>
+    <li>Watched service status</li>
+    <li>Last backup timestamp</li>
+    <li>Recent health log output</li>
+  </ul>
+
+  <p>The dashboard is not meant to be a full observability system. It is meant to answer the first questions you ask when a remote Pi feels unhealthy:</p>
+
+  <ul>
+    <li>Is it online?</li>
+    <li>What IP does it have?</li>
+    <li>Are the important services running?</li>
+    <li>Did backups happen?</li>
+    <li>What did the last health checks report?</li>
+  </ul>
+
+  <p>The dashboard escapes rendered output before returning HTML. That is important because logs and service output should never be trusted as safe markup.</p>
+
+  <h2>Backups</h2>
+
+  <p>The backup script is <code>backup.sh</code>.</p>
+
+  <p>It looks for a USB drive with a configurable filesystem label:</p>
+
+  <pre><code>BACKUP_LABEL=PI_BACKUP
+BACKUP_MOUNT=/mnt/backup</code></pre>
+
+  <p>If the drive exists, the script mounts it and creates a compressed archive:</p>
+
+  <pre><code>tar --warning=no-file-changed --ignore-failed-read -czf "$ARCHIVE" /etc /home</code></pre>
+
+  <p>Backups are retained for seven days.</p>
+
+  <p>Older versions could mark a backup as successful even after a hard <code>tar</code> failure. The new version checks the tar exit code and verifies that the archive exists before writing <code>last_backup.txt</code>.</p>
+
+  <p>That small detail matters. A backup system should not create false confidence.</p>
+
+  <h2>Systemd as the Runtime</h2>
+
+  <p>Pi Guardian uses systemd timers instead of cron.</p>
+
+  <p>The health timer runs every five minutes:</p>
+
+  <pre><code>[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true</code></pre>
+
+  <p>The backup timer runs nightly:</p>
+
+  <pre><code>[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true</code></pre>
+
+  <p>The dashboard runs as a normal service and restarts on failure.</p>
+
+  <p>Using systemd gives the application predictable logs, restart behavior, and status inspection through familiar commands:</p>
+
+  <pre><code>systemctl status pidash.service
+journalctl -u pihealth.service -n 100 --no-pager</code></pre>
+
+  <h2>The Intention</h2>
+
+  <p>Pi Guardian is not trying to be a large platform. It is a practical safety layer for small devices.</p>
+
+  <p>The design priorities are:</p>
+
+  <ul>
+    <li>One command should install the system</li>
+    <li>Remote access should not require public SSH</li>
+    <li>Firewall rules should not lock users out during setup</li>
+    <li>Services should run with only the privileges they need</li>
+    <li>Health status should be visible without installing a full monitoring stack</li>
+    <li>Backups should be automatic and easy to understand</li>
+  </ul>
+
+  <p>For many Raspberry Pi projects, that is enough.</p>
+
+  <p>A Pi running in a closet, garage, lab, or remote site does not always need Kubernetes, Prometheus, or a complex deployment pipeline. Sometimes it needs a secure overlay connection, a dashboard, health checks, and a backup archive on a USB drive.</p>
+
+  <p>That is what Pi Guardian provides.</p>
+
+  <h2>Final Thoughts</h2>
+
+  <p>The project started from a common frustration: setting up Tailscale, SSH, firewall rules, health checks, and backups manually on a headless Raspberry Pi is repetitive and easy to get wrong.</p>
+
+  <p>Pi Guardian turns that setup into a single script with safer defaults.</p>
+
+  <p>It is still intentionally transparent. The installer is just Bash. The monitor and dashboard are small Python files. The services are plain systemd units. Everything can be inspected, modified, or removed.</p>
+
+  <p>That is the kind of tooling I prefer for small infrastructure: boring, readable, and useful when something goes wrong.</p>
+</article>
+</body>
+</html>
