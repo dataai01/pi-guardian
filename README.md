@@ -1,5 +1,7 @@
 # Pi Guardian (v0.2.0)
 
+![Pi Guardian hero image](assets/pi-guardian-hero.png)
+
 Pi Guardian is a one-script Raspberry Pi hardening and monitoring installer for
 headless devices.
 

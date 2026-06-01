@@ -77,19 +77,30 @@
       font-size: inherit;
       padding: 0;
     }
+
+    .repo-link {
+      color: #555555;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      font-size: 18px;
+      margin: -10px 0 30px;
+    }
+
+    a {
+      color: #0969da;
+    }
   </style>
 </head>
 <body>
 <article>
   <h1>Pi Guardian: A One-Script Safety Layer for Headless Raspberry Pis</h1>
 
+  <p class="repo-link"><strong>GitHub repository:</strong> <a href="https://github.com/dataai01/pi-guardian">https://github.com/dataai01/pi-guardian</a></p>
+
   <p>Running a Raspberry Pi as a small server is easy until it is not. The hard part usually starts after the Pi is deployed somewhere without a monitor, keyboard, or easy physical access. Remote access needs to be secure. SSH needs to be reliable. Backups need to happen without manual effort. Health problems should be visible before the device silently disappears.</p>
 
   <p>Pi Guardian was built for that exact problem.</p>
 
   <p>It is a small Raspberry Pi hardening and monitoring toolkit designed around one goal: make a headless Pi safer and easier to operate with a single installer script.</p>
-
-  <p>The source and future updates are available on GitHub: <a href="https://github.com/dataai01/pi-guardian">github.com/dataai01/pi-guardian</a>.</p>
 
   <p>The application combines four practical pieces:</p>
 
