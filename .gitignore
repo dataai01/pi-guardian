@@ -21,3 +21,4 @@ pi-guardian.env
 Thumbs.db
 .idea/
 .vscode/
+.playwright-mcp/
