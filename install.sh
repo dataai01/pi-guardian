@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 APP_USER="pi-guardian"
 APP_GROUP="pi-guardian"
 APP_DIR="/opt/pi-guardian"
@@ -15,7 +15,9 @@ TS_AUTHKEY="${TS_AUTHKEY:-${TS_AUTH_KEY:-}}"
 TS_AUTHKEY_FILE=""
 TS_HOSTNAME="${TS_HOSTNAME:-}"
 TS_ADVERTISE_TAGS="${TS_ADVERTISE_TAGS:-}"
-TAILSCALE_SSH=1
+# Preserve an existing SSH mode; new installs use OpenSSH over the VPN.
+TAILSCALE_SSH=""
+TS_LOGIN_TIMEOUT=300
 SKIP_TAILSCALE_UP=0
 FORCE_TAILSCALE_RESET=0
 
@@ -34,17 +36,22 @@ ALLOW_LAN_DASH=0
 ALLOW_LAN_SSH=0
 SKIP_FIREWALL=0
 TAILSCALE_READY=0
+TAILSCALE_IP=""
+SSH_PORTS=()
+RECOVERY_IP=""
+RECOVERY_PORT=""
+INSTALL_TMP=""
 
 usage() {
   cat <<EOF
 Pi Guardian self-contained installer v$VERSION
 
 Usage:
-  sudo bash ./install.sh [options]
+  bash ./install.sh [options]
 
 Recommended non-interactive Tailscale install:
   export TS_AUTHKEY=<tailscale-auth-key>
-  sudo -E bash ./install.sh --ts-hostname my-pi
+  bash ./install.sh --ts-hostname my-pi
 
 Options:
   --vpn tailscale|wireguard|none   VPN mode (default: tailscale)
@@ -52,7 +59,9 @@ Options:
   --ts-authkey-file PATH           Read Tailscale auth key from a root-readable file
   --ts-hostname NAME               Tailscale MagicDNS hostname for this Pi
   --tailscale-tags TAGS            Tailscale advertise tags, for example tag:server
-  --no-tailscale-ssh               Do not enable Tailscale SSH
+  --tailscale-ssh                  Opt in to Tailscale-managed SSH (requires SSH policy)
+  --no-tailscale-ssh               Use OpenSSH instead of Tailscale-managed SSH
+  --login-timeout SECONDS          Time to finish browser login (default: 300)
   --skip-tailscale-up              Install Tailscale but do not authenticate/connect it
   --reset-tailscale                Pass --reset to tailscale up when authenticating
   --pubkey "ssh-ed25519 AAAA..."   Install an SSH public key for the primary user
@@ -68,8 +77,9 @@ Options:
   -h|--help                        Show this help
 
 Notes:
-  Without an auth key, the installer runs an interactive 'tailscale up' when a
-  terminal is available. Without a terminal, it prints the exact command to run.
+  The installer asks for sudo when needed. Without an auth key, open the printed
+  login URL on your computer or phone; setup continues automatically after login.
+  Your connecting SSH address is kept as a firewall recovery rule.
 EOF
 }
 
@@ -92,7 +102,13 @@ on_error() {
   warn "Install failed at line $line with exit code $code. See $LOG_FILE."
   exit "$code"
 }
-trap 'on_error "$LINENO" "$?"' ERR
+
+cleanup() {
+  if [[ -n "$INSTALL_TMP" && -d "$INSTALL_TMP" ]]; then
+    rm -f -- "$INSTALL_TMP/authkey" "$INSTALL_TMP/tailscale-install.sh"
+    rmdir -- "$INSTALL_TMP" || true
+  fi
+}
 
 require_value() {
   local flag="$1"
@@ -102,57 +118,79 @@ require_value() {
   fi
 }
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --vpn) require_value "$1" "${2:-}"; VPN="$2"; shift 2;;
-    --ts-authkey) require_value "$1" "${2:-}"; TS_AUTHKEY="$2"; shift 2;;
-    --ts-authkey-file) require_value "$1" "${2:-}"; TS_AUTHKEY_FILE="$2"; shift 2;;
-    --ts-hostname) require_value "$1" "${2:-}"; TS_HOSTNAME="$2"; shift 2;;
-    --tailscale-tags|--advertise-tags) require_value "$1" "${2:-}"; TS_ADVERTISE_TAGS="$2"; shift 2;;
-    --no-tailscale-ssh) TAILSCALE_SSH=0; shift;;
-    --skip-tailscale-up) SKIP_TAILSCALE_UP=1; shift;;
-    --reset-tailscale) FORCE_TAILSCALE_RESET=1; shift;;
-    --pubkey) require_value "$1" "${2:-}"; PUBKEY="$2"; shift 2;;
-    --pubkey-file) require_value "$1" "${2:-}"; PUBKEY_FILE="$2"; shift 2;;
-    --no-ssh-hardening) SSH_HARDEN=0; shift;;
-    --services) require_value "$1" "${2:-}"; SERVICES="$2"; SERVICES_REQUESTED=1; shift 2;;
-    --backup-label) require_value "$1" "${2:-}"; BACKUP_LABEL="$2"; BACKUP_LABEL_REQUESTED=1; shift 2;;
-    --dashboard-bind) require_value "$1" "${2:-}"; DASH_BIND="$2"; DASH_BIND_REQUESTED=1; shift 2;;
-    --dashboard-port) require_value "$1" "${2:-}"; DASH_PORT="$2"; DASH_PORT_REQUESTED=1; shift 2;;
-    --allow-lan-dashboard) ALLOW_LAN_DASH=1; shift;;
-    --allow-lan-ssh) ALLOW_LAN_SSH=1; shift;;
-    --skip-firewall) SKIP_FIREWALL=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) die "Unknown option: $1";;
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vpn) require_value "$1" "${2:-}"; VPN="$2"; shift 2;;
+      --ts-authkey) require_value "$1" "${2:-}"; TS_AUTHKEY="$2"; shift 2;;
+      --ts-authkey-file) require_value "$1" "${2:-}"; TS_AUTHKEY_FILE="$2"; shift 2;;
+      --ts-hostname) require_value "$1" "${2:-}"; TS_HOSTNAME="$2"; shift 2;;
+      --tailscale-tags|--advertise-tags) require_value "$1" "${2:-}"; TS_ADVERTISE_TAGS="$2"; shift 2;;
+      --tailscale-ssh) TAILSCALE_SSH=true; shift;;
+      --no-tailscale-ssh) TAILSCALE_SSH=false; shift;;
+      --login-timeout) require_value "$1" "${2:-}"; TS_LOGIN_TIMEOUT="$2"; shift 2;;
+      --skip-tailscale-up) SKIP_TAILSCALE_UP=1; shift;;
+      --reset-tailscale) FORCE_TAILSCALE_RESET=1; shift;;
+      --pubkey) require_value "$1" "${2:-}"; PUBKEY="$2"; shift 2;;
+      --pubkey-file) require_value "$1" "${2:-}"; PUBKEY_FILE="$2"; shift 2;;
+      --no-ssh-hardening) SSH_HARDEN=0; shift;;
+      --services) require_value "$1" "${2:-}"; SERVICES="$2"; SERVICES_REQUESTED=1; shift 2;;
+      --backup-label) require_value "$1" "${2:-}"; BACKUP_LABEL="$2"; BACKUP_LABEL_REQUESTED=1; shift 2;;
+      --dashboard-bind) require_value "$1" "${2:-}"; DASH_BIND="$2"; DASH_BIND_REQUESTED=1; shift 2;;
+      --dashboard-port) require_value "$1" "${2:-}"; DASH_PORT="$2"; DASH_PORT_REQUESTED=1; shift 2;;
+      --allow-lan-dashboard) ALLOW_LAN_DASH=1; shift;;
+      --allow-lan-ssh) ALLOW_LAN_SSH=1; shift;;
+      --skip-firewall) SKIP_FIREWALL=1; shift;;
+      -h|--help) usage; exit 0;;
+      *) die "Unknown option: $1";;
+    esac
+  done
+}
+
+validate_options() {
+  case "$VPN" in
+    tailscale|wireguard|none) ;;
+    *) die "--vpn must be one of: tailscale, wireguard, none";;
   esac
-done
 
-if [[ $EUID -ne 0 ]]; then
-  echo "Please run with sudo/root."
-  exit 1
-fi
+  if ! [[ "$DASH_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$DASH_PORT < 1 || 10#$DASH_PORT > 65535 )); then
+    die "--dashboard-port must be a TCP port from 1 to 65535."
+  fi
+  DASH_PORT=$((10#$DASH_PORT))
 
-mkdir -p "$(dirname "$LOG_FILE")"
-touch "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2>&1
+  if ! [[ "$TS_LOGIN_TIMEOUT" =~ ^[0-9]{1,4}$ ]] || (( 10#$TS_LOGIN_TIMEOUT < 1 || 10#$TS_LOGIN_TIMEOUT > 3600 )); then
+    die "--login-timeout must be from 1 to 3600 seconds."
+  fi
+  TS_LOGIN_TIMEOUT=$((10#$TS_LOGIN_TIMEOUT))
+}
 
-case "$VPN" in
-  tailscale|wireguard|none) ;;
-  *) die "--vpn must be one of: tailscale, wireguard, none";;
-esac
+prepare_install() {
+  if [[ $EUID -ne 0 ]]; then
+    command -v sudo >/dev/null 2>&1 || die "Run this installer as root (sudo is not installed)."
+    [[ -f "$0" ]] || die "Download install.sh to a file, then run: bash ./install.sh"
+    log "Requesting administrator access..."
+    exec sudo --preserve-env=TS_AUTHKEY,TS_AUTH_KEY,TS_HOSTNAME,TS_ADVERTISE_TAGS,SSH_CONNECTION bash "$0" "$@"
+  fi
 
-if ! [[ "$DASH_PORT" =~ ^[0-9]+$ ]] || (( DASH_PORT < 1 || DASH_PORT > 65535 )); then
-  die "--dashboard-port must be a TCP port from 1 to 65535."
-fi
+  command -v apt-get >/dev/null 2>&1 || die "This installer supports Raspberry Pi OS and Debian/Ubuntu with apt-get."
+  [[ -d /run/systemd/system ]] || die "Boot the Pi into a systemd-based OS before running this installer."
+  mkdir -p "$(dirname "$LOG_FILE")"
+  touch "$LOG_FILE"
+  chmod 600 "$LOG_FILE"
+  exec > >(tee -a "$LOG_FILE") 2>&1
+  INSTALL_TMP="$(mktemp -d /tmp/pi-guardian.XXXXXXXX)"
+  trap cleanup EXIT
 
-if [[ -n "$TS_AUTHKEY_FILE" ]]; then
-  [[ -r "$TS_AUTHKEY_FILE" ]] || die "Cannot read --ts-authkey-file: $TS_AUTHKEY_FILE"
-  TS_AUTHKEY="$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")"
-fi
+  if [[ -n "$TS_AUTHKEY_FILE" ]]; then
+    [[ -r "$TS_AUTHKEY_FILE" ]] || die "Cannot read --ts-authkey-file: $TS_AUTHKEY_FILE"
+    TS_AUTHKEY="$(tr -d '\r\n' < "$TS_AUTHKEY_FILE")"
+    [[ -n "$TS_AUTHKEY" ]] || die "The Tailscale auth key file is empty."
+  fi
 
-if [[ "$SERVICES_REQUESTED" -eq 0 && "$VPN" != "tailscale" ]]; then
-  SERVICES="ssh"
-fi
+  if [[ "$SERVICES_REQUESTED" -eq 0 && "$VPN" != "tailscale" ]]; then
+    SERVICES="ssh"
+  fi
+}
 
 write_file() {
   local path="$1"
@@ -200,8 +238,8 @@ install_dependencies() {
 
   log "Installing OS dependencies..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y ca-certificates curl ufw python3 python3-venv python3-pip iproute2 util-linux
+  apt-get -o Acquire::Retries=3 update -y
+  apt-get -o Acquire::Retries=3 install -y ca-certificates curl ufw python3 python3-venv python3-pip iproute2 util-linux openssh-server
   if ! apt-get install -y python3-flask; then
     warn "python3-flask was not available from apt; the installer will use pip in the venv."
   fi
@@ -738,6 +776,19 @@ ENV_DEFAULT
   if [[ "$DASH_PORT_REQUESTED" -eq 1 ]]; then
     set_env DASH_PORT "$DASH_PORT"
   fi
+
+  # Read only dashboard values, never execute the environment file as shell code.
+  local key value
+  while IFS='=' read -r key value; do
+    value="${value%$'\r'}"
+    value="${value%\"}"; value="${value#\"}"
+    value="${value%\'}"; value="${value#\'}"
+    case "$key" in
+      DASH_PORT) DASH_PORT="$value";;
+      DASH_BIND) DASH_BIND="$value";;
+    esac
+  done < "$ENV_FILE"
+  validate_options
 }
 
 write_systemd_units() {
@@ -845,6 +896,17 @@ PY_CHECK
     "$APP_DIR/src/pi_guardian/dash.py"
 }
 
+enable_ssh() {
+  log "Enabling OpenSSH..."
+  # sshd -t needs the privilege-separation directory even on a fresh install.
+  install -d -m 0755 /run/sshd
+  sshd -t
+  systemctl enable --now ssh
+  systemctl is-active --quiet ssh || die "OpenSSH did not start. See: journalctl -u ssh -n 50"
+  mapfile -t SSH_PORTS < <(sshd -T | awk '$1 == "port" {print $2}')
+  [[ ${#SSH_PORTS[@]} -gt 0 ]] || die "Could not determine the OpenSSH listening port."
+}
+
 configure_ssh() {
   local primary_user
   local home_dir
@@ -903,10 +965,45 @@ SSH_CONFIG
 
 tailscale_diagnostics() {
   warn "Tailscale diagnostics:"
-  systemctl --no-pager --full status tailscaled || true
-  tailscale status || true
-  tailscale ip || true
+  timeout 10 systemctl --no-pager --full status tailscaled || true
+  timeout 10 tailscale status || true
   ls -l /dev/net/tun || true
+}
+
+refresh_tailscale_status() {
+  local status
+  TAILSCALE_READY=0
+  TAILSCALE_IP=""
+  status="$(timeout 10 tailscale status --json 2>/dev/null)" || return 1
+  if ! TAILSCALE_IP="$(printf '%s' "$status" | python3 -c '
+import ipaddress, json, sys
+try:
+    status = json.load(sys.stdin)
+    if status.get("BackendState") != "Running" or not status.get("TUN"):
+        sys.exit(1)
+    if not (status.get("Self") or {}).get("Online"):
+        sys.exit(1)
+    address = next(ipaddress.ip_address(value) for value in status.get("TailscaleIPs", [])
+                   if ipaddress.ip_address(value).version == 4)
+    print(address)
+except (ValueError, TypeError, AttributeError, StopIteration):
+    sys.exit(1)
+')"; then
+    return 1
+  fi
+  ip link show tailscale0 >/dev/null 2>&1 || return 1
+  TAILSCALE_READY=1
+}
+
+wait_for_tailscale() {
+  local attempt
+  for attempt in {1..15}; do
+    if refresh_tailscale_status; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
 }
 
 install_tailscale() {
@@ -916,69 +1013,91 @@ install_tailscale() {
 
   if ! command -v tailscale >/dev/null 2>&1; then
     log "Installing Tailscale..."
-    curl -fsSL https://tailscale.com/install.sh -o /tmp/pi-guardian-tailscale-install.sh
-    sh /tmp/pi-guardian-tailscale-install.sh
+    curl --fail --show-error --silent --location --retry 3 --connect-timeout 15 --max-time 120 \
+      https://tailscale.com/install.sh -o "$INSTALL_TMP/tailscale-install.sh"
+    sh "$INSTALL_TMP/tailscale-install.sh"
   else
     log "Tailscale is already installed."
   fi
 
+  if [[ ! -e /dev/net/tun ]]; then
+    log "Loading the tun kernel module..."
+    modprobe tun || die "The tun kernel module is unavailable; cannot set up remote access."
+  fi
+  [[ -c /dev/net/tun ]] || die "/dev/net/tun is missing. Remote access needs a kernel TUN device."
   systemctl enable --now tailscaled
 
-  if [[ ! -e /dev/net/tun ]]; then
-    warn "/dev/net/tun is missing; trying to load the tun kernel module."
-    modprobe tun || warn "Could not load tun. Tailscale may not work until tun is available."
-  fi
+  local attempt daemon_ready=0
+  for attempt in {1..15}; do
+    if timeout 10 tailscale status --json >/dev/null 2>&1; then
+      daemon_ready=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$daemon_ready" -eq 1 ]] || die "tailscaled did not become ready. See: journalctl -u tailscaled -n 50"
 
   if [[ "$SKIP_TAILSCALE_UP" -eq 1 ]]; then
-    warn "Skipping tailscale up as requested."
-  elif tailscale status >/dev/null 2>&1 && tailscale ip -4 >/dev/null 2>&1; then
-    log "Tailscale is already authenticated."
-    if [[ "$TAILSCALE_SSH" -eq 1 ]]; then
-      tailscale set --ssh || warn "Could not enable Tailscale SSH with 'tailscale set --ssh'."
-    fi
-  elif [[ -n "$TS_AUTHKEY" ]]; then
-    log "Authenticating Tailscale with auth key..."
-    local up_args=(up --auth-key "$TS_AUTHKEY")
-    if [[ "$TAILSCALE_SSH" -eq 1 ]]; then
-      up_args+=(--ssh)
-    fi
-    if [[ -n "$TS_HOSTNAME" ]]; then
-      up_args+=(--hostname "$TS_HOSTNAME")
-    fi
-    if [[ -n "$TS_ADVERTISE_TAGS" ]]; then
-      up_args+=(--advertise-tags "$TS_ADVERTISE_TAGS")
-    fi
-    if [[ "$FORCE_TAILSCALE_RESET" -eq 1 ]]; then
-      up_args+=(--reset)
-    fi
-    if ! tailscale "${up_args[@]}"; then
-      tailscale_diagnostics
-      die "Tailscale authentication failed. Check the auth key, device approval, tags, and network connectivity."
-    fi
-  elif [[ -t 0 && -t 1 ]]; then
-    warn "No Tailscale auth key provided; starting interactive Tailscale login."
-    local up_args=(up)
-    if [[ "$TAILSCALE_SSH" -eq 1 ]]; then
-      up_args+=(--ssh)
-    fi
-    if [[ -n "$TS_HOSTNAME" ]]; then
-      up_args+=(--hostname "$TS_HOSTNAME")
-    fi
-    if ! tailscale "${up_args[@]}"; then
-      tailscale_diagnostics
-      die "Interactive Tailscale login failed."
-    fi
-  else
-    warn "No Tailscale auth key and no interactive terminal."
-    warn "After install, run: sudo tailscale up --ssh"
+    refresh_tailscale_status || true
+    warn "Skipping Tailscale login as requested."
+    return
   fi
 
-  if tailscale ip -4 >/dev/null 2>&1; then
-    TAILSCALE_READY=1
-    log "Tailscale IPv4: $(tailscale ip -4 | head -n1)"
-  else
-    warn "Tailscale is installed but not authenticated yet."
+  connect_tailscale
+}
+
+connect_tailscale() {
+  # Keep a resumed 'up' completely flag-free. Even --timeout prevents Tailscale's
+  # preserve-existing-preferences shortcut; enforce the deadline externally.
+  local up_args=(up)
+  local set_args=(set)
+  local connected=0
+  if refresh_tailscale_status; then
+    connected=1
   fi
+
+  # A plain 'up' resumes an existing profile without resetting DNS/routes/etc.
+  # --reset is used only when explicitly requested by the caller.
+  if [[ "$FORCE_TAILSCALE_RESET" -eq 1 ]]; then
+    up_args+=(--reset)
+    [[ -z "$TS_HOSTNAME" ]] || up_args+=("--hostname=$TS_HOSTNAME")
+    [[ -z "$TAILSCALE_SSH" ]] || up_args+=("--ssh=$TAILSCALE_SSH")
+  else
+    [[ -z "$TS_HOSTNAME" ]] || set_args+=("--hostname=$TS_HOSTNAME")
+    [[ -z "$TAILSCALE_SSH" ]] || set_args+=("--ssh=$TAILSCALE_SSH")
+  fi
+  [[ -z "$TS_ADVERTISE_TAGS" ]] || up_args+=("--advertise-tags=$TS_ADVERTISE_TAGS")
+  if [[ "$connected" -eq 0 || "$FORCE_TAILSCALE_RESET" -eq 1 || -n "$TS_ADVERTISE_TAGS" ]]; then
+    if [[ -n "$TS_AUTHKEY" && "$connected" -eq 0 ]]; then
+      log "Connecting Tailscale with the supplied auth key..."
+      # Keep the secret out of process arguments and remove it immediately after use.
+      (umask 077; printf '%s' "$TS_AUTHKEY" > "$INSTALL_TMP/authkey")
+      up_args+=("--auth-key=file:$INSTALL_TMP/authkey")
+    else
+      log "Open the Tailscale login link below on your computer or phone if prompted."
+      log "Waiting up to $TS_LOGIN_TIMEOUT seconds for login/device approval..."
+    fi
+    local result=0
+    timeout --foreground "$TS_LOGIN_TIMEOUT" tailscale "${up_args[@]}" || result=$?
+    rm -f -- "$INSTALL_TMP/authkey"
+    unset TS_AUTHKEY TS_AUTH_KEY
+    if [[ "$result" -ne 0 ]]; then
+      tailscale_diagnostics
+      die "Tailscale setup did not finish. Complete the login/device approval and rerun this installer. Check the key or tags if supplied. Existing profile preferences are preserved; any required flags are shown above."
+    fi
+  else
+    log "Using the existing Tailscale connection."
+  fi
+
+  if [[ ${#set_args[@]} -gt 1 ]]; then
+    timeout 30 tailscale "${set_args[@]}" || die "Could not apply the requested Tailscale preferences. Existing SSH sessions may require reconnecting if you explicitly changed SSH mode."
+  fi
+  unset TS_AUTHKEY TS_AUTH_KEY
+  if ! wait_for_tailscale; then
+    tailscale_diagnostics
+    die "Tailscale is not online with a usable tunnel. Check login, device approval, key expiry, and network connectivity, then rerun this installer."
+  fi
+  log "Tailscale connected: $TAILSCALE_IP"
 }
 
 install_wireguard_tools() {
@@ -990,38 +1109,72 @@ install_wireguard_tools() {
   warn "WireGuard tools are installed, but Pi Guardian does not generate a wg0 tunnel configuration."
 }
 
+detect_recovery_connection() {
+  [[ -n "${SSH_CONNECTION:-}" ]] || return 0
+  local connection
+  connection="$(python3 -c '
+import ipaddress, os, sys
+try:
+    client, client_port, server, server_port = os.environ["SSH_CONNECTION"].split()
+    client = ipaddress.ip_address(client)
+    ipaddress.ip_address(server)
+    port = int(server_port)
+    if not 1 <= port <= 65535:
+        raise ValueError("invalid port")
+    print(client, port)
+except (ValueError, KeyError):
+    sys.exit(1)
+')" || die "Cannot identify the current SSH connection; refusing to change the firewall."
+  read -r RECOVERY_IP RECOVERY_PORT <<< "$connection"
+}
+
 configure_firewall() {
   if [[ "$SKIP_FIREWALL" -eq 1 ]]; then
     warn "Skipping firewall configuration as requested."
     return
   fi
 
-  if [[ "$VPN" == "tailscale" && "$TAILSCALE_READY" -ne 1 && "$ALLOW_LAN_SSH" -ne 1 ]]; then
-    warn "Tailscale is not authenticated; skipping UFW changes to avoid locking out SSH."
-    warn "Authenticate Tailscale, then rerun install.sh or configure UFW manually."
+  if [[ "$VPN" == "tailscale" ]] && ! refresh_tailscale_status; then
+    warn "Tailscale is not connected; skipping UFW changes to preserve current access."
+    if [[ "$SKIP_TAILSCALE_UP" -ne 1 ]]; then
+      die "The Tailscale connection was lost. Check connectivity and rerun the installer."
+    fi
+    return
+  fi
+  if [[ "$VPN" == "wireguard" ]] && ! ip link show wg0 >/dev/null 2>&1; then
+    warn "wg0 is not configured; skipping UFW changes to preserve current access."
+    return
+  fi
+  if [[ "$VPN" == "none" && "$ALLOW_LAN_SSH" -ne 1 ]]; then
+    warn "No VPN selected; skipping UFW changes. Use --allow-lan-ssh to configure LAN access."
     return
   fi
 
+  detect_recovery_connection
   log "Configuring UFW..."
-  ufw --force default deny incoming
-  ufw --force default allow outgoing
+  # Add recovery/allow rules before changing policy or enabling UFW. Inserting
+  # recovery first also handles an existing broad deny rule for the SSH port.
+  if [[ -n "$RECOVERY_IP" ]]; then
+    ufw insert 1 allow proto tcp from "$RECOVERY_IP" to any port "$RECOVERY_PORT" comment 'Pi Guardian installer recovery'
+    log "Keeping SSH from $RECOVERY_IP on port $RECOVERY_PORT for recovery."
+  fi
 
+  local overlay_interface="" port
   case "$VPN" in
-    tailscale)
-      ufw allow in on tailscale0 to any port 22 proto tcp
-      ufw allow in on tailscale0 to any port "$DASH_PORT" proto tcp
-      ;;
-    wireguard)
-      ufw allow in on wg0 to any port 22 proto tcp
-      ufw allow in on wg0 to any port "$DASH_PORT" proto tcp
-      ;;
-    none)
-      warn "No VPN interface selected; no overlay-specific UFW rules were added."
-      ;;
+    tailscale) overlay_interface=tailscale0;;
+    wireguard) overlay_interface=wg0;;
   esac
+  if [[ -n "$overlay_interface" ]]; then
+    for port in "${SSH_PORTS[@]}" 22; do
+      ufw allow in on "$overlay_interface" to any port "$port" proto tcp
+    done
+    ufw allow in on "$overlay_interface" to any port "$DASH_PORT" proto tcp
+  fi
 
   if [[ "$ALLOW_LAN_SSH" -eq 1 ]]; then
-    ufw allow 22/tcp
+    for port in "${SSH_PORTS[@]}"; do
+      ufw allow "$port/tcp"
+    done
   fi
 
   if [[ "$ALLOW_LAN_DASH" -eq 1 ]]; then
@@ -1029,6 +1182,8 @@ configure_firewall() {
     ufw allow "$DASH_PORT/tcp"
   fi
 
+  ufw --force default deny incoming
+  ufw --force default allow outgoing
   ufw --force enable
   ufw status verbose || true
 }
@@ -1043,12 +1198,29 @@ enable_services() {
   systemctl start pihealth.service || warn "Initial health check failed; inspect with: journalctl -u pihealth.service -n 100 --no-pager"
 }
 
-print_summary() {
-  local overlay_ip=""
-  if command -v tailscale >/dev/null 2>&1; then
-    overlay_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+verify_dashboard() {
+  local host="$DASH_BIND" attempt ready=0
+  case "$host" in
+    0.0.0.0) host=127.0.0.1;;
+    ::) host='[::1]';;
+    *:*) host="[$host]";;
+  esac
+  for attempt in {1..10}; do
+    if curl --noproxy '*' --fail --silent --max-time 10 "http://$host:$DASH_PORT/" >/dev/null; then
+      ready=1
+      break
+    fi
+    sleep 2
+  done
+  [[ "$ready" -eq 1 ]] || die "The dashboard did not respond on $host:$DASH_PORT. See: journalctl -u pidash.service -n 50"
+  systemctl is-active --quiet pidash.service || die "The dashboard service stopped unexpectedly."
+  if [[ "$VPN" == "tailscale" && "$TAILSCALE_READY" -eq 1 ]]; then
+    curl --noproxy '*' --fail --silent --show-error --max-time 20 "http://$TAILSCALE_IP:$DASH_PORT/" >/dev/null \
+      || die "The dashboard is not reachable at the Tailscale address. Check DASH_BIND in $ENV_FILE (normally 0.0.0.0)."
   fi
+}
 
+print_summary() {
   echo
   log "Installation complete."
   echo "    Health checks:   pihealth.timer (every 5 minutes)"
@@ -1056,30 +1228,43 @@ print_summary() {
   echo "    Backups:         pibackup.timer (03:30)"
   echo "    Config:          $ENV_FILE"
   echo "    Install log:     $LOG_FILE"
-  if [[ -n "$overlay_ip" ]]; then
-    echo "    Dashboard URL:   http://$overlay_ip:$DASH_PORT/"
-  else
-    echo "    Dashboard URL:   http://<tailscale-ip>:$DASH_PORT/"
-    if [[ "$VPN" == "tailscale" ]]; then
-      echo "    Tailscale next:  sudo tailscale up --ssh"
-    fi
+  if [[ "$VPN" == "tailscale" && "$TAILSCALE_READY" -eq 1 ]]; then
+    echo "    Dashboard URL:   http://$TAILSCALE_IP:$DASH_PORT/"
+    echo "    SSH:             ssh -p ${SSH_PORTS[0]} $(detect_primary_user)@$TAILSCALE_IP"
+    echo "    Connect your computer/phone to the same Tailscale network first."
+    echo "    Local tunnel and dashboard checks passed; access from another device depends on your tailnet policy."
+  elif [[ "$VPN" == "tailscale" ]]; then
+    warn "Remote access is NOT ready (--skip-tailscale-up was requested). Rerun without that flag to finish."
+  elif [[ "$VPN" == "wireguard" ]]; then
+    echo "    Remote access:   configure and test wg0 separately."
+  fi
+  if [[ -n "$RECOVERY_IP" ]]; then
+    echo "    Recovery SSH:    $RECOVERY_IP -> port $RECOVERY_PORT (UFW rule retained)"
   fi
 }
 
 main() {
+  parse_args "$@"
+  validate_options
+  trap 'on_error "$LINENO" "$?"' ERR
+  prepare_install "$@"
   log "Starting Pi Guardian installer v$VERSION..."
   install_dependencies
   ensure_app_user
   write_application_files
   write_config
   install_python_env
-  configure_ssh
+  enable_ssh
   install_tailscale
   install_wireguard_tools
   write_systemd_units
   enable_services
+  verify_dashboard
+  configure_ssh
   configure_firewall
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

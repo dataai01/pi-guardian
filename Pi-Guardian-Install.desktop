@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Install Pi Guardian
+Comment=Set up remote access, monitoring, and backups on this Raspberry Pi
+Exec=python3 -c "import os,subprocess,sys; from urllib.parse import unquote,urlparse; p=sys.argv[1]; p=unquote(urlparse(p).path) if p.startswith('file:') else p; sys.exit(subprocess.call(['bash',os.path.join(os.path.dirname(p),'install-desktop.sh')]))" %k
+Icon=utilities-terminal
+Terminal=true
+Categories=System;

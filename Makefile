@@ -1,8 +1,8 @@
 # Convenience wrapper around install/uninstall scripts
-.PHONY: install uninstall enable disable
+.PHONY: install uninstall enable disable test
 
 install:
-	sudo bash ./install.sh
+	bash ./install.sh
 
 uninstall:
 	sudo bash ./uninstall.sh
@@ -12,3 +12,6 @@ enable:
 
 disable:
 	sudo systemctl disable --now pihealth.timer pidash.service pibackup.timer
+
+test:
+	python3 -m unittest discover -s tests -v

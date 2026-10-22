@@ -4,6 +4,7 @@
 Makefile text eol=lf
 *.service text eol=lf
 *.timer text eol=lf
+*.desktop text eol=lf
 *.py text eol=lf
 *.md text eol=lf
 VERSION text eol=lf
